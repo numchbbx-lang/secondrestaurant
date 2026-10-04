@@ -5,6 +5,9 @@ const App = (() => {
   async function api(path, options = {}) {
     const headers = {"Content-Type":"application/json", ...(options.headers || {})};
     if (state.token) headers.Authorization = `Bearer ${state.token}`;
+    if (options.method && options.method !== "GET" && options.method !== "PATCH" && !headers["Idempotency-Key"]) {
+      headers["Idempotency-Key"] = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    }
     const res = await fetch(path, {...options, headers});
     let data = {};
     try { data = await res.json(); } catch (_) {}
@@ -135,9 +138,15 @@ const App = (() => {
   async function reserve(event) {
     event.preventDefault();
     if (!state.user) return go("login");
+    const phone = $("res-phone").value.trim();
+    const name = $("res-name").value.trim();
+    if (!/^[0-9]{10}$/.test(phone) || !phone.startsWith("0")) return toast("เบอร์โทรต้องเป็นตัวเลข 10 หลักและขึ้นต้นด้วย 0");
+    if (!/(?=.*[A-Za-zก-๙])/.test(name)) return toast("ชื่อต้องมีตัวอักษรอย่างน้อย 1 ตัว");
+    const selected = new Date($("res-date").value);
+    if (Number.isNaN(selected.getTime()) || selected.getTime() < Date.now() + 30 * 60 * 1000) return toast("กรุณาจองล่วงหน้าอย่างน้อย 30 นาที");
     try {
       const data = await api("/api/reservations",{method:"POST",body:JSON.stringify({
-        customer_name:$("res-name").value, phone:$("res-phone").value,
+        customer_name:name, phone,
         table_number:$("res-table").value, datetime:$("res-date").value
       })});
       toast("จองโต๊ะสำเร็จ"); event.target.reset(); loadReservations();
@@ -218,7 +227,7 @@ const App = (() => {
 
   async function saveMenu(e,id){e.preventDefault();try{const body={name:$("mf-name").value,category:$("mf-category").value,price:$("mf-price").value,image_url:$("mf-image").value,is_out_of_stock:$("mf-stock").checked};await api(id?`/api/menus/${id}`:"/api/menus",{method:id?"PATCH":"POST",body:JSON.stringify(body)});closeModal();toast("บันทึกเมนูสำเร็จ");adminPage("menus")}catch(x){toast(x.message)}}
   async function deleteMenu(id){if(!confirm("ลบเมนูนี้หรือไม่?"))return;try{await api(`/api/menus/${id}`,{method:"DELETE"});toast("ลบเมนูสำเร็จ");adminPage("menus")}catch(e){toast(e.message)}}
-  function showStaffForm(){$("modal").classList.remove("hidden");$("modal").innerHTML=`<div><h2>Add Staff</h2><form onsubmit="App.saveStaff(event)"><label>ชื่อ<input id="sf-name" required></label><label>Email<input id="sf-email" type="email" required></label><label>Password<input id="sf-pass" type="password" minlength="6" required></label><div class="actions"><button class="primary">Create Staff</button><button type="button" class="secondary" onclick="App.closeModal()">Cancel</button></div></form></div>`}
+  function showStaffForm(){$("modal").classList.remove("hidden");$("modal").innerHTML=`<div><h2>Add Staff</h2><form onsubmit="App.saveStaff(event)"><label>ชื่อ<input id="sf-name" minlength="2" maxlength="100" pattern="(?=.*[A-Za-zก-๙])[A-Za-zก-๙0-9 .'-]+" required></label><label>Email<input id="sf-email" type="email" required></label><label>Password<input id="sf-pass" type="password" minlength="8" maxlength="128" required></label><div class="actions"><button class="primary">Create Staff</button><button type="button" class="secondary" onclick="App.closeModal()">Cancel</button></div></form></div>`}
   async function saveStaff(e){e.preventDefault();try{await api("/api/users/staff",{method:"POST",body:JSON.stringify({name:$("sf-name").value,email:$("sf-email").value,password:$("sf-pass").value})});closeModal();toast("เพิ่ม Staff สำเร็จ");adminPage("users")}catch(x){toast(x.message)}}
   async function toggleUser(id,active){try{await api(`/api/users/${id}`,{method:"PATCH",body:JSON.stringify({active})});toast("อัปเดตผู้ใช้แล้ว");adminPage("users")}catch(e){toast(e.message)}}
   function closeModal(){$("modal").classList.add("hidden");$("modal").innerHTML=""}

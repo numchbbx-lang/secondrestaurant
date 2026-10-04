@@ -2,6 +2,7 @@ import json
 import uuid
 import mimetypes
 import os
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -17,8 +18,9 @@ try:
         update_user_role, set_user_active, AuthError
     )
     from .biz_logic import (
-        now_iso, clean_text, to_positive_number, to_positive_int, calculate_bill,
-        paginate, search_filter_sort, ensure_table_can_order, validate_menu_payload
+        now_iso, clean_text, validate_person_name, validate_phone, validate_datetime,
+        to_positive_number, to_positive_int, calculate_bill, paginate, search_filter_sort,
+        ensure_table_can_order, validate_menu_payload
     )
 except ImportError:
     # Supports `python api/index.py` from the project root as well as package imports on Vercel.
@@ -33,8 +35,9 @@ except ImportError:
         update_user_role, set_user_active, AuthError
     )
     from biz_logic import (
-        now_iso, clean_text, to_positive_number, to_positive_int, calculate_bill,
-        paginate, search_filter_sort, ensure_table_can_order, validate_menu_payload
+        now_iso, clean_text, validate_person_name, validate_phone, validate_datetime,
+        to_positive_number, to_positive_int, calculate_bill, paginate, search_filter_sort,
+        ensure_table_can_order, validate_menu_payload
     )
 
 PUBLIC_GETS = {"/api/health", "/api/config"}
@@ -96,21 +99,42 @@ def build_order_items(raw_items):
         raise ValueError("ออเดอร์ต้องมีรายการอาหาร")
     final_items = []
     for raw in raw_items:
+        if not isinstance(raw, dict):
+            raise ValueError("รายการอาหารไม่ถูกต้อง")
         menu = find_by_id("menus", raw.get("menu_id"))
         if not menu:
             raise ValueError("ไม่พบเมนู")
         if menu.get("is_out_of_stock"):
             raise ValueError(f"เมนู {menu.get('name')} หมด")
-        qty = to_positive_int(raw.get("quantity", 1), "จำนวน")
+        qty = to_positive_int(raw.get("quantity", 1), "จำนวน", maximum=99)
+        options = raw.get("options") or {}
+        if not isinstance(options, dict) or len(options) > 20:
+            raise ValueError("ตัวเลือกเมนูไม่ถูกต้อง")
         final_items.append({
             "menu_id": menu["id"], "name": menu["name"], "unit_price": float(menu["price"]),
-            "quantity": qty, "options": raw.get("options") or {}
+            "quantity": qty, "options": options
         })
     return final_items
 
 def public_menu_list():
     data = get("menus") or {}
     return [v for v in data.values() if isinstance(v, dict)] if isinstance(data, dict) else []
+
+def reservation_conflicts(table_number, requested_at, exclude_id=None):
+    reservations = get("reservations") or {}
+    active = {"waiting", "confirmed", "seated"}
+    for item in reservations.values() if isinstance(reservations, dict) else []:
+        if not isinstance(item, dict) or item.get("id") == exclude_id:
+            continue
+        if item.get("status") not in active or str(item.get("table_number")) != str(table_number):
+            continue
+        try:
+            existing = validate_datetime(item.get("datetime"))
+        except ValueError:
+            continue
+        if abs((existing - requested_at).total_seconds()) < 90 * 60:
+            return True
+    return False
 
 class handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -242,9 +266,8 @@ class handler(BaseHTTPRequestHandler):
                 if not safe_email(email):
                     raise ValueError("อีเมลไม่ถูกต้อง")
                 if not validate_password(password):
-                    raise ValueError("รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร")
-                if not name:
-                    raise ValueError("กรุณากรอกชื่อ")
+                    raise ValueError("รหัสผ่านต้องยาว 8-128 ตัวอักษร และมีพิมพ์ใหญ่ พิมพ์เล็ก ตัวเลข และอักขระพิเศษ")
+                name = validate_person_name(name)
                 auth = firebase_signup(email, password)
                 profile = create_profile(auth["localId"], email, name, "customer", password=password)
                 return response(self, 201, {"ok": True, "message": "สมัครสมาชิกสำเร็จ", "token": auth["idToken"], "user": profile})
@@ -266,6 +289,7 @@ class handler(BaseHTTPRequestHandler):
                 name = str(data.get("name", "itailaew Admin")).strip()
                 if not safe_email(email) or not validate_password(password):
                     raise ValueError("ข้อมูล Admin ไม่ถูกต้อง")
+                name = validate_person_name(name, "ชื่อ Admin")
                 auth = firebase_signup(email, password)
                 profile = create_profile(auth["localId"], email, name, "admin", password=password)
                 return response(self, 201, {"ok": True, "message": "สร้าง Admin สำเร็จ", "user": profile})
@@ -286,8 +310,9 @@ class handler(BaseHTTPRequestHandler):
                 email = str(data.get("email", "")).strip().lower()
                 password = data.get("password")
                 name = str(data.get("name", "")).strip()
-                if not safe_email(email) or not validate_password(password) or not name:
+                if not safe_email(email) or not validate_password(password):
                     raise ValueError("ข้อมูล Staff ไม่ถูกต้อง")
+                name = validate_person_name(name, "ชื่อ Staff")
                 auth = firebase_signup(email, password)
                 staff = create_profile(auth["localId"], email, name, "staff", password=password)
                 audit(profile, "CREATE_STAFF", "user", staff["id"], email)
@@ -356,6 +381,19 @@ class handler(BaseHTTPRequestHandler):
                 table = find_by_id("tables", table_id)
                 if not table:
                     raise ValueError("ไม่พบโต๊ะ")
+                if table.get("status") == "reserved":
+                    raise ValueError("โต๊ะนี้ถูกจองไว้")
+                if table.get("status") not in {"available", "occupied", "waiting_bill"}:
+                    raise ValueError("โต๊ะนี้ยังไม่พร้อมรับออเดอร์")
+                claimed_by = table.get("claimed_by")
+                if claimed_by and claimed_by != profile["id"]:
+                    raise ValueError("คุณไม่มีสิทธิ์สั่งอาหารจากโต๊ะนี้")
+                idempotency_key = self.headers.get("Idempotency-Key", "").strip()
+                if idempotency_key:
+                    orders = get("orders") or {}
+                    for existing in orders.values() if isinstance(orders, dict) else []:
+                        if isinstance(existing, dict) and existing.get("idempotency_key") == idempotency_key and existing.get("customer_id") == profile["id"]:
+                            return response(self, 200, {"ok": True, "order": existing, "duplicate": True})
                 final_items = build_order_items(data.get("items"))
                 order_id = new_id("order")
                 bill = calculate_bill(final_items, 0)
@@ -363,10 +401,10 @@ class handler(BaseHTTPRequestHandler):
                     "id": order_id, "table_id": table_id, "table_number": table.get("table_number"),
                     "customer_id": profile["id"], "items": final_items, **bill,
                     "status": "open", "created_by": profile["id"], "created_at": now_iso(),
-                    "source": "qr"
+                    "source": "qr", "idempotency_key": idempotency_key or None
                 }
                 put(f"orders/{order_id}", order)
-                patch(f"tables/{table_id}", {"status": "occupied", "current_order_id": order_id})
+                patch(f"tables/{table_id}", {"status": "occupied", "current_order_id": order_id, "claimed_by": profile["id"]})
                 for item in final_items:
                     kid = new_id("kit")
                     put(f"kitchen/{kid}", {
@@ -417,12 +455,24 @@ class handler(BaseHTTPRequestHandler):
                 return response(self, 200, {"ok": True, "message": "รวมโต๊ะสำเร็จ", "order_id": target_order["id"]})
 
             if path == "/api/reservations":
-                name = clean_text(data.get("customer_name"), "ชื่อ", 100)
-                phone = clean_text(data.get("phone"), "เบอร์โทร", 30)
+                name = validate_person_name(data.get("customer_name"), "ชื่อ")
+                phone = validate_phone(data.get("phone"))
                 table_number = clean_text(data.get("table_number"), "โต๊ะ", 20)
+                tables = get("tables") or {}
+                table = next((t for t in tables.values() if isinstance(t, dict) and str(t.get("table_number")) == table_number), None) if isinstance(tables, dict) else None
+                if not table:
+                    raise ValueError("ไม่พบโต๊ะที่ระบุ")
+                requested_at = validate_datetime(data.get("datetime"), "วันเวลา")
+                now = datetime.now(timezone.utc)
+                if requested_at.tzinfo is None:
+                    requested_at = requested_at.replace(tzinfo=timezone.utc)
+                if requested_at < now + timedelta(minutes=30):
+                    raise ValueError("กรุณาจองล่วงหน้าอย่างน้อย 30 นาที")
+                if reservation_conflicts(table_number, requested_at):
+                    raise ValueError("โต๊ะนี้มีการจองในช่วงเวลาดังกล่าวแล้ว")
                 reservation = {
                     "id": new_id("res"), "customer_id": profile["id"], "customer_name": name,
-                    "phone": phone, "table_number": table_number, "datetime": clean_text(data.get("datetime"), "วันเวลา", 60),
+                    "phone": phone, "table_number": table_number, "datetime": requested_at.isoformat(),
                     "status": "waiting", "created_at": now_iso()
                 }
                 put(f"reservations/{reservation['id']}", reservation)

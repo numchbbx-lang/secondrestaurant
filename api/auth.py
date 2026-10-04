@@ -186,7 +186,14 @@ def safe_email(email):
 
 
 def validate_password(password):
-    return isinstance(password, str) and len(password) >= 6
+    if not isinstance(password, str) or not 8 <= len(password) <= 128:
+        return False
+    return (
+        any(ch.islower() for ch in password)
+        and any(ch.isupper() for ch in password)
+        and any(ch.isdigit() for ch in password)
+        and any(not ch.isalnum() for ch in password)
+    )
 
 
 def create_profile(uid, email, name, role="customer", password=None):
